@@ -5,31 +5,41 @@ package pubsub
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
+
+type sub[V any] struct {
+	ch   chan V
+	stop func() bool
+}
+
+type topicState[V any] struct {
+	mu      sync.RWMutex
+	subs    []sub[V]
+	deleted bool
+}
 
 // PubSub is a thread-safe, generic topic manager.
 // It allows multiple subscribers to listen to specific topics and
 // publishers to broadcast messages to those topics.
 //
 // T represents the type of the payload being published.
-type PubSub[T any] struct {
-	capacity    int
-	subscribers map[string][]chan T
-	mutex       sync.RWMutex
+type PubSub[K comparable, V any] struct {
+	capacity   int
+	topics     sync.Map
+	closed     atomic.Bool
+	closedChan chan V
 }
 
-// New creates a new PubSub instance with a default channel capacity of 1.
-func New[T any]() *PubSub[T] {
-	return &PubSub[T]{
-		capacity:    1,
-		subscribers: make(map[string][]chan T),
+// New creates a new PubSub instance.
+func New[K comparable, V any](capacity int) *PubSub[K, V] {
+	cc := make(chan V)
+	close(cc)
+
+	return &PubSub[K, V]{
+		capacity:   capacity,
+		closedChan: cc,
 	}
-}
-
-// WithCapacity sets the buffer size for new subscription channels.
-func (pubsub *PubSub[T]) WithCapacity(capacity int) *PubSub[T] {
-	pubsub.capacity = capacity
-	return pubsub
 }
 
 // Publish broadcasts the payload to all subscribers of the given topic.
@@ -37,13 +47,23 @@ func (pubsub *PubSub[T]) WithCapacity(capacity int) *PubSub[T] {
 // This method is non-blocking. If a subscriber's channel is full (slow consumer),
 // the message is dropped for that specific subscriber to prevent blocking
 // the publisher or other subscribers.
-func (pubsub *PubSub[T]) Publish(topic string, payload T) {
-	pubsub.mutex.RLock()
-	defer pubsub.mutex.RUnlock()
+func (p *PubSub[K, V]) Publish(topic K, payload V) {
+	if p.closed.Load() {
+		return
+	}
 
-	for _, ch := range pubsub.subscribers[topic] {
+	val, ok := p.topics.Load(topic)
+	if !ok {
+		return
+	}
+	state := val.(*topicState[V])
+
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+
+	for _, s := range state.subs {
 		select {
-		case ch <- payload:
+		case s.ch <- payload:
 		default:
 		}
 	}
@@ -55,40 +75,117 @@ func (pubsub *PubSub[T]) Publish(topic string, payload T) {
 // The subscription is tied to the provided context. When ctx is canceled
 // or times out, the subscription is automatically removed, and the
 // returned channel is closed.
-//
-// Panic: This function panics if a nil context is provided.
-func (pubsub *PubSub[T]) Subscribe(ctx context.Context, topic string) <-chan T {
-	if ctx == nil {
-		panic("pubsub: nil context provided to Subscribe")
+func (p *PubSub[K, V]) Subscribe(ctx context.Context, topic K) <-chan V {
+	if ctx == nil || ctx.Err() != nil || p.closed.Load() {
+		return p.closedChan
 	}
 
-	channel := make(chan T, pubsub.capacity)
+	ch := make(chan V, p.capacity)
+	var state *topicState[V]
 
-	pubsub.mutex.Lock()
-	pubsub.subscribers[topic] = append(pubsub.subscribers[topic], channel)
-	pubsub.mutex.Unlock()
+	for {
+		if p.closed.Load() {
+			return p.closedChan
+		}
 
-	go func() {
-		<-ctx.Done()
-		pubsub.mutex.Lock()
-		defer pubsub.mutex.Unlock()
+		val, ok := p.topics.Load(topic)
+		if !ok {
+			val, _ = p.topics.LoadOrStore(topic, &topicState[V]{})
+		}
+		state = val.(*topicState[V])
 
-		subscribers := pubsub.subscribers[topic]
-		for i, ch := range subscribers {
-			if ch == channel {
-				copy(subscribers[i:], subscribers[i+1:])
-				subscribers[len(subscribers)-1] = nil
-				pubsub.subscribers[topic] = subscribers[:len(subscribers)-1]
-				break
+		state.mu.Lock()
+		if p.closed.Load() {
+			state.mu.Unlock()
+			return p.closedChan
+		}
+
+		if state.deleted {
+			state.mu.Unlock()
+			continue
+		}
+
+		stop := context.AfterFunc(ctx, func() {
+			p.removeSubscriber(topic, ch)
+		})
+
+		state.subs = append(state.subs, sub[V]{
+			ch:   ch,
+			stop: stop,
+		})
+
+		state.mu.Unlock()
+		break
+	}
+
+	return ch
+}
+
+func (p *PubSub[K, V]) removeSubscriber(topic K, ch chan V) {
+	val, ok := p.topics.Load(topic)
+	if !ok {
+		return
+	}
+	state := val.(*topicState[V])
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.deleted {
+		return
+	}
+
+	found := false
+	for i, s := range state.subs {
+		if s.ch == ch {
+			found = true
+			lastIdx := len(state.subs) - 1
+			state.subs[i] = state.subs[lastIdx]
+			state.subs[lastIdx] = sub[V]{}
+			state.subs = state.subs[:lastIdx]
+			break
+		}
+	}
+
+	if !found {
+		return
+	}
+
+	if n := len(state.subs); n > 0 && n <= cap(state.subs)/4 {
+		newSubs := make([]sub[V], n)
+		copy(newSubs, state.subs)
+		state.subs = newSubs
+	}
+
+	if len(state.subs) == 0 {
+		state.deleted = true
+		p.topics.Delete(topic)
+	}
+
+	close(ch)
+}
+
+// Close gracefully shuts down the PubSub instance.
+// It prevents any new publishers or subscribers and safely closes all
+// currently active subscriber channels. Safe to call multiple times.
+func (p *PubSub[K, V]) Close() {
+	if p.closed.CompareAndSwap(false, true) {
+		p.topics.Range(func(key, value any) bool {
+			state := value.(*topicState[V])
+
+			state.mu.Lock()
+			if !state.deleted {
+				for _, s := range state.subs {
+					s.stop()
+					close(s.ch)
+				}
+				state.subs = nil
+				state.deleted = true
+				p.topics.Delete(key)
 			}
-		}
+			state.mu.Unlock()
 
-		if len(pubsub.subscribers[topic]) == 0 {
-			delete(pubsub.subscribers, topic)
-		}
-
-		close(channel)
-	}()
-
-	return channel
+			return true
+		})
+	}
 }

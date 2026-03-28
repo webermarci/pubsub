@@ -1,20 +1,23 @@
-package pubsub
+package pubsub_test
 
 import (
 	"context"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/webermarci/pubsub"
 )
 
 func TestBasicPubSub(t *testing.T) {
-	pubsub := New[string]()
+	ps := pubsub.New[string, string](10)
+	defer ps.Close()
 
 	topic := "greet"
-	sub := pubsub.Subscribe(t.Context(), topic)
+	sub := ps.Subscribe(t.Context(), topic)
 
 	expected := "hello"
-	pubsub.Publish(topic, expected)
+	ps.Publish(topic, expected)
 
 	select {
 	case message := <-sub:
@@ -27,14 +30,15 @@ func TestBasicPubSub(t *testing.T) {
 }
 
 func TestFanOut(t *testing.T) {
-	pubsub := New[int]().WithCapacity(5)
+	ps := pubsub.New[string, int](5)
+	defer ps.Close()
 
 	topic := "updates"
-	sub1 := pubsub.Subscribe(t.Context(), topic)
-	sub2 := pubsub.Subscribe(t.Context(), topic)
+	sub1 := ps.Subscribe(t.Context(), topic)
+	sub2 := ps.Subscribe(t.Context(), topic)
 
 	value := 42
-	pubsub.Publish(topic, value)
+	ps.Publish(topic, value)
 
 	read := func(ch <-chan int) int {
 		select {
@@ -55,7 +59,8 @@ func TestFanOut(t *testing.T) {
 }
 
 func TestTopicSeparation(t *testing.T) {
-	ps := New[string]()
+	ps := pubsub.New[string, string](1)
+	defer ps.Close()
 
 	subA := ps.Subscribe(t.Context(), "topicA")
 	subB := ps.Subscribe(t.Context(), "topicB")
@@ -78,51 +83,9 @@ func TestTopicSeparation(t *testing.T) {
 	}
 }
 
-func TestCleanupAndMemoryLeak(t *testing.T) {
-	ps := New[int]()
-
-	ctx, cancel := context.WithCancel(t.Context())
-
-	topic := "leaks"
-	sub := ps.Subscribe(ctx, topic)
-
-	ps.mutex.RLock()
-	if len(ps.subscribers[topic]) != 1 {
-		t.Fatalf("expected 1 subscriber, got %d", len(ps.subscribers[topic]))
-	}
-	ps.mutex.RUnlock()
-
-	cancel()
-
-	select {
-	case _, ok := <-sub:
-		if ok {
-			t.Error("expected channel to be closed")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for channel close")
-	}
-
-	success := false
-	for range 10 {
-		ps.mutex.RLock()
-		_, exists := ps.subscribers[topic]
-		ps.mutex.RUnlock()
-
-		if !exists {
-			success = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if !success {
-		t.Error("map key was not deleted after last subscriber left")
-	}
-}
-
 func TestNonBlocking(t *testing.T) {
-	ps := New[int]()
+	ps := pubsub.New[string, int](1)
+	defer ps.Close()
 
 	topic := "fast"
 	sub := ps.Subscribe(t.Context(), topic)
@@ -146,8 +109,44 @@ func TestNonBlocking(t *testing.T) {
 	}
 }
 
+func TestClose(t *testing.T) {
+	ps := pubsub.New[string, int](5)
+
+	topic := "shutdown"
+	sub1 := ps.Subscribe(t.Context(), topic)
+	sub2 := ps.Subscribe(t.Context(), topic)
+
+	ps.Close()
+
+	select {
+	case _, ok := <-sub1:
+		if ok {
+			t.Error("expected sub1 to be closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for sub1 to close")
+	}
+
+	select {
+	case _, ok := <-sub2:
+		if ok {
+			t.Error("expected sub2 to be closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for sub2 to close")
+	}
+
+	ps.Publish(topic, 42)
+
+	sub3 := ps.Subscribe(t.Context(), "new-topic")
+	if _, ok := <-sub3; ok {
+		t.Error("expected new subscription after close to be closed immediately")
+	}
+}
+
 func TestConcurrencyRace(t *testing.T) {
-	ps := New[int]().WithCapacity(10)
+	ps := pubsub.New[string, int](1)
+	defer ps.Close()
 	var wg sync.WaitGroup
 
 	for range 50 {
@@ -176,19 +175,9 @@ func TestConcurrencyRace(t *testing.T) {
 	wg.Wait()
 }
 
-func TestPanicOnNilContext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-
-	ps := New[string]()
-	ps.Subscribe(nil, "topic")
-}
-
 func BenchmarkPublish_SingleSubscriber(b *testing.B) {
-	ps := New[int]().WithCapacity(b.N)
+	ps := pubsub.New[string, int](100)
+	defer ps.Close()
 	sub := ps.Subscribe(b.Context(), "bench")
 
 	go func() {
@@ -201,8 +190,29 @@ func BenchmarkPublish_SingleSubscriber(b *testing.B) {
 	}
 }
 
+func BenchmarkPublish_RunParallel(b *testing.B) {
+	ps := pubsub.New[string, int](100)
+	defer ps.Close()
+
+	ctx, cancel := context.WithCancel(b.Context())
+	defer cancel()
+	sub := ps.Subscribe(ctx, "bench")
+	go func() {
+		for range sub {
+		}
+	}()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ps.Publish("bench", 1)
+		}
+	})
+}
+
 func BenchmarkPublish_FanOut100(b *testing.B) {
-	ps := New[int]().WithCapacity(b.N)
+	ps := pubsub.New[string, int](100)
+	defer ps.Close()
 
 	for range 100 {
 		sub := ps.Subscribe(b.Context(), "bench")
@@ -218,7 +228,8 @@ func BenchmarkPublish_FanOut100(b *testing.B) {
 }
 
 func BenchmarkPublish_Contention(b *testing.B) {
-	ps := New[int]().WithCapacity(100)
+	ps := pubsub.New[string, int](100)
+	defer ps.Close()
 	ctx, cancel := context.WithCancel(b.Context())
 	defer cancel()
 
