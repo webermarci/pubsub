@@ -10,13 +10,14 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.26
-
-      - name: Checkout
-        uses: actions/checkout@v7
+          go-version: 'stable'
+          check-latest: true
 
       - name: Test
         run: go test -v -race ./...
