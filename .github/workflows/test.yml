@@ -8,6 +8,12 @@ jobs:
   test:
     permissions:
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.26.x", "stable"]
+
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -16,8 +22,24 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
-          go-version: 'stable'
+          go-version: ${{ matrix.go-version }}
           check-latest: true
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files=( $(git ls-files -- '*.go') )
+          unformatted=$(gofmt -l "${files[@]}")
+
+          if [[ -n "$unformatted" ]]; then
+            echo "The following Go files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Test
         run: go test -v -race ./...
