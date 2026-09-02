@@ -27,21 +27,71 @@ func WithBuffer(size int) SubscriptionOption {
 	}
 }
 
-func (t *Topic[T]) remove(subscription *subscription[T]) {
+type subscriber[T any] interface {
+	publish(context.Context, T) error
+}
+
+func subscribe[T, S any](
+	t *Topic[T],
+	ctx context.Context,
+	convert func(T) (S, bool),
+	opts ...SubscriptionOption,
+) <-chan S {
+	if t == nil {
+		panic("pubsub: cannot subscribe to a nil topic")
+	}
+	if ctx == nil {
+		panic("pubsub: subscription context cannot be nil")
+	}
+
+	config := subscriptionConfig{}
+	for _, opt := range opts {
+		if opt == nil {
+			panic("pubsub: subscription option cannot be nil")
+		}
+		opt(&config)
+	}
+
+	if ctx.Err() != nil {
+		return closedChannel[S]()
+	}
+
+	subscription := &subscription[T, S]{
+		topic:   t,
+		values:  make(chan S, config.buffer),
+		done:    make(chan struct{}),
+		convert: convert,
+	}
+
+	t.subscribersMu.Lock()
+	if ctx.Err() != nil {
+		t.subscribersMu.Unlock()
+		close(subscription.values)
+		return subscription.values
+	}
+	t.subscribers[subscription] = struct{}{}
+	t.subscribersMu.Unlock()
+
+	context.AfterFunc(ctx, subscription.close)
+	return subscription.values
+}
+
+func (t *Topic[T]) remove(subscription subscriber[T]) {
 	t.subscribersMu.Lock()
 	delete(t.subscribers, subscription)
 	t.subscribersMu.Unlock()
 }
 
-type subscription[T any] struct {
-	topic  *Topic[T]
-	values chan T
-	done   chan struct{}
-	closed atomic.Bool
-	mu     sync.Mutex
+type subscription[T, S any] struct {
+	topic   *Topic[T]
+	values  chan S
+	done    chan struct{}
+	convert func(T) (S, bool)
+	closed  atomic.Bool
+	mu      sync.Mutex
 }
 
-func (s *subscription[T]) close() {
+func (s *subscription[T, S]) close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
@@ -54,9 +104,14 @@ func (s *subscription[T]) close() {
 	s.mu.Unlock()
 }
 
-func (s *subscription[T]) publish(ctx context.Context, value T) error {
+func (s *subscription[T, S]) publish(ctx context.Context, value T) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	converted, ok := s.convert(value)
+	if !ok {
+		return nil
 	}
 
 	s.mu.Lock()
@@ -67,7 +122,7 @@ func (s *subscription[T]) publish(ctx context.Context, value T) error {
 	}
 
 	select {
-	case s.values <- value:
+	case s.values <- converted:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

@@ -81,3 +81,65 @@ func BenchmarkPublish_FanOut100(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPublish_SubscribeAsConcrete(b *testing.B) {
+	topic := pubsub.New[any]()
+	ctx, cancel := context.WithCancel(b.Context())
+	defer cancel()
+
+	subscription := topic.SubscribeAs[int](ctx)
+	go func() {
+		for range subscription {
+		}
+	}()
+
+	b.ResetTimer()
+	for b.Loop() {
+		if err := topic.Publish(ctx, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPublish_SubscribeAsMixed(b *testing.B) {
+	topic := pubsub.New[any]()
+	ctx, cancel := context.WithCancel(b.Context())
+	defer cancel()
+
+	for range 10 {
+		matching := topic.SubscribeAs[int](ctx)
+		go func() {
+			for range matching {
+			}
+		}()
+		topic.SubscribeAs[string](ctx)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		if err := topic.Publish(ctx, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPublish_SubscribeAsFanOut100(b *testing.B) {
+	topic := pubsub.New[any]()
+	ctx, cancel := context.WithCancel(b.Context())
+	defer cancel()
+
+	for range 100 {
+		subscription := topic.SubscribeAs[int](ctx)
+		go func() {
+			for range subscription {
+			}
+		}()
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		if err := topic.Publish(ctx, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

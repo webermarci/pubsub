@@ -5,20 +5,20 @@ import (
 	"sync"
 )
 
-// Topic broadcasts each published value to every active subscription.
+// Topic broadcasts each published value to every matching active subscription.
 //
 // Topic is passive and does not need to be started or supervised. Its
 // subscriptions are unbuffered by default, so Publish applies direct
-// backpressure until every active subscriber receives the value.
+// backpressure until every matching active subscriber receives the value.
 type Topic[T any] struct {
-	subscribers   map[*subscription[T]]struct{}
+	subscribers   map[subscriber[T]]struct{}
 	subscribersMu sync.RWMutex
 }
 
 // New creates a typed, unbuffered topic.
 func New[T any]() *Topic[T] {
 	return &Topic[T]{
-		subscribers: make(map[*subscription[T]]struct{}),
+		subscribers: make(map[subscriber[T]]struct{}),
 	}
 }
 
@@ -26,47 +26,27 @@ func New[T any]() *Topic[T] {
 // ctx. The returned channel closes when ctx is canceled. Subscriptions are
 // unbuffered by default; use WithBuffer to enable bounded buffering.
 func (t *Topic[T]) Subscribe(ctx context.Context, opts ...SubscriptionOption) <-chan T {
-	if t == nil {
-		panic("pubsub: cannot subscribe to a nil topic")
-	}
-	if ctx == nil {
-		panic("pubsub: subscription context cannot be nil")
-	}
-
-	config := subscriptionConfig{}
-	for _, opt := range opts {
-		if opt == nil {
-			panic("pubsub: subscription option cannot be nil")
-		}
-		opt(&config)
-	}
-
-	if ctx.Err() != nil {
-		return closedChannel[T]()
-	}
-
-	subscription := &subscription[T]{
-		topic:  t,
-		values: make(chan T, config.buffer),
-		done:   make(chan struct{}),
-	}
-
-	t.subscribersMu.Lock()
-	if ctx.Err() != nil {
-		t.subscribersMu.Unlock()
-		close(subscription.values)
-		return subscription.values
-	}
-	t.subscribers[subscription] = struct{}{}
-	t.subscribersMu.Unlock()
-
-	context.AfterFunc(ctx, subscription.close)
-	return subscription.values
+	return subscribe(t, ctx, func(value T) (T, bool) {
+		return value, true
+	}, opts...)
 }
 
-// Publish sends value to every subscription that is active when publishing
-// begins. A canceled context stops delivery and returns its error. Delivery to
-// subscriptions that already received the value cannot be rolled back.
+// SubscribeAs creates an independent subscription that receives values
+// published on t that are assignable to S. Values that are not assignable to S
+// do not participate in backpressure for this subscription.
+//
+// The subscription lifetime and buffering behavior are the same as Subscribe.
+func (t *Topic[T]) SubscribeAs[S any](ctx context.Context, opts ...SubscriptionOption) <-chan S {
+	return subscribe(t, ctx, func(value T) (S, bool) {
+		converted, ok := any(value).(S)
+		return converted, ok
+	}, opts...)
+}
+
+// Publish sends value to every matching subscription that is active when
+// publishing begins. A canceled context stops delivery and returns its error.
+// Delivery to subscriptions that already received the value cannot be rolled
+// back.
 func (t *Topic[T]) Publish(ctx context.Context, value T) error {
 	if t == nil {
 		panic("pubsub: cannot publish to a nil topic")
@@ -79,7 +59,7 @@ func (t *Topic[T]) Publish(ctx context.Context, value T) error {
 	}
 
 	t.subscribersMu.RLock()
-	subscribers := make([]*subscription[T], 0, len(t.subscribers))
+	subscribers := make([]subscriber[T], 0, len(t.subscribers))
 	for subscriber := range t.subscribers {
 		subscribers = append(subscribers, subscriber)
 	}
