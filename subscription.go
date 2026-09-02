@@ -34,7 +34,7 @@ type subscriber[T any] interface {
 func subscribe[T, S any](
 	t *Topic[T],
 	ctx context.Context,
-	convert func(T) (S, bool),
+	match func(T) (S, bool),
 	opts ...SubscriptionOption,
 ) <-chan S {
 	if t == nil {
@@ -57,10 +57,10 @@ func subscribe[T, S any](
 	}
 
 	subscription := &subscription[T, S]{
-		topic:   t,
-		values:  make(chan S, config.buffer),
-		done:    make(chan struct{}),
-		convert: convert,
+		topic:  t,
+		values: make(chan S, config.buffer),
+		done:   make(chan struct{}),
+		match:  match,
 	}
 
 	t.subscribersMu.Lock()
@@ -83,12 +83,12 @@ func (t *Topic[T]) remove(subscription subscriber[T]) {
 }
 
 type subscription[T, S any] struct {
-	topic   *Topic[T]
-	values  chan S
-	done    chan struct{}
-	convert func(T) (S, bool)
-	closed  atomic.Bool
-	mu      sync.Mutex
+	topic  *Topic[T]
+	values chan S
+	done   chan struct{}
+	match  func(T) (S, bool)
+	closed atomic.Bool
+	mu     sync.Mutex
 }
 
 func (s *subscription[T, S]) close() {
@@ -109,7 +109,7 @@ func (s *subscription[T, S]) publish(ctx context.Context, value T) error {
 		return err
 	}
 
-	converted, ok := s.convert(value)
+	matched, ok := s.match(value)
 	if !ok {
 		return nil
 	}
@@ -122,7 +122,7 @@ func (s *subscription[T, S]) publish(ctx context.Context, value T) error {
 	}
 
 	select {
-	case s.values <- converted:
+	case s.values <- matched:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

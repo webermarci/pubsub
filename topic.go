@@ -38,8 +38,8 @@ func (t *Topic[T]) Subscribe(ctx context.Context, opts ...SubscriptionOption) <-
 // The subscription lifetime and buffering behavior are the same as Subscribe.
 func (t *Topic[T]) SubscribeAs[S any](ctx context.Context, opts ...SubscriptionOption) <-chan S {
 	return subscribe(t, ctx, func(value T) (S, bool) {
-		converted, ok := any(value).(S)
-		return converted, ok
+		matched, ok := any(value).(S)
+		return matched, ok
 	}, opts...)
 }
 
